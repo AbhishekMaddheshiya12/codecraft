@@ -11,4 +11,4 @@ const dislikeSchema = new mongoose.Schema({
     }
 })
 
-export const DisLike = mongoose.model.DisLiKe||mongoose.model("Like",dislikeSchema)
+export const DisLike = mongoose.model.DisLiKe||mongoose.model("DisLike",dislikeSchema)
