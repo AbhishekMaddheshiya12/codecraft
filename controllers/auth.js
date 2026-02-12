@@ -99,9 +99,16 @@ const login = async (req, res) => {
 
 const Logout = async (req, res) => {
   try {
-    return res.cookie("codeCraft", "", { maxAge: -1 }).status(200).json({
+    res.clearCookie("codeCraft",  {
+      httpOnly: true,
+      secure: true,     
+      sameSite: "none",  
+      path: "/",         
+    });
+    
+    return res.status(200).json({
       success: true,
-      message: "User Logged Out Successfully",
+      message: "User logged out successfully",
     });
   } catch (error) {
     return res.status(400).json({
