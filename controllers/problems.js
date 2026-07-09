@@ -4,13 +4,10 @@ import { Problem } from "../models/problems.js";
 import { User } from "../models/user.js";
 import { GoogleGenAI } from "@google/genai";
 
-const encodeBase64 = (str) => {
-  return btoa(
-    new TextEncoder()
-      .encode(str)
-      .reduce((data, byte) => data + String.fromCharCode(byte), "")
-  );
-};
+const encodeBase64 = (str) => Buffer.from(str, "utf8").toString("base64");
+
+const decodeBase64 = (str) => Buffer.from(str, "base64").toString("utf8");
+
 const getAllProblem = async (req, res) => {
   try {
     const problems = await Problem.find({});
@@ -21,81 +18,92 @@ const getAllProblem = async (req, res) => {
   }
 };
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 const getSubmissionResult = async (tokens) => {
-  console.log(tokens);
   try {
-    const options = {
-      method: "GET",
-      url: "https://judge0-extra-ce.p.rapidapi.com/submissions/batch",
-      params: {
-        tokens: tokens?.join(","),
-        base64_encoded: "true",
-        fields: "*",
-      },
-      headers: {
-        "x-rapidapi-key": "bb2e866215msh150f4914a869517p1f7dc2jsn6c612857138c",
-        "x-rapidapi-host": "judge0-extra-ce.p.rapidapi.com",
-      },
-    };
+    let pendingTokens = [...tokens];
+    const results = new Array(tokens.length);
 
-    const response = await axios.request(options);
-    const { submissions } = response.data;
+    while (pendingTokens.length > 0) {
+      const options = {
+        method: "GET",
+        url: "https://judge0-extra-ce.p.rapidapi.com/submissions/batch",
+        params: {
+          tokens: pendingTokens.join(","),
+          base64_encoded: "true",
+          fields: "*",
+        },
+        headers: {
+          "x-rapidapi-key": process.env.RAPID_API_KEY,
+          "x-rapidapi-host": "judge0-extra-ce.p.rapidapi.com",
+        },
+      };
 
-    if (!submissions || submissions.length === 0) {
-      console.error("No submissions returned.");
-      return [];
+      const response = await axios.request(options);
+
+      const submissions = response.data.submissions || [];
+
+      const nextPending = [];
+
+      submissions.forEach((submission, index) => {
+        const originalIndex = tokens.indexOf(pendingTokens[index]);
+
+        if (
+          !submission ||
+          submission.status.description === "In Queue" ||
+          submission.status.description === "Processing"
+        ) {
+          nextPending.push(pendingTokens[index]);
+          return;
+        }
+
+        results[originalIndex] = {
+          id: originalIndex + 1,
+          status: submission.status.description,
+          stdout: Buffer.from(submission.stdout || "", "base64").toString(
+            "utf8",
+          ),
+          stderr: Buffer.from(submission.stderr || "", "base64").toString(
+            "utf8",
+          ),
+          compile_output: Buffer.from(
+            submission.compile_output || "",
+            "base64",
+          ).toString("utf8"),
+        };
+      });
+
+      pendingTokens = nextPending;
+
+      if (pendingTokens.length > 0) {
+        await sleep(1000);
+      }
     }
-    const results = [];
-    const processingTokens = [];
+
     let hasFailure = false;
     let failureStatus = "Accepted";
 
-    submissions.forEach((submission, index) => {
-      if (!submission || submission.status.description === "Processing") {
-        processingTokens.push(tokens[index]);
-      } else {
-        const status = submission.status.description;
-        results.push({
-          id: index + 1,
-          status,
-          stdout: atob(submission.stdout || ""),
-          stderr: atob(submission.stderr || ""),
-        });
-
-        if (status !== "Accepted" && !hasFailure) {
-          hasFailure = true;
-          failureStatus = status;
-        }
-      }
-    });
-
-    // console.log("Processed Results:", results);
-
-    if (processingTokens.length > 0) {
-      // console.log(
-      //   `Retrying for ${processingTokens.length} submissions still processing...`
-      // );
-      const retryResults = await getSubmissionResult(processingTokens);
-      results.push(...(retryResults.results || []));
-
-      if (retryResults.hasFailure && !hasFailure) {
+    for (const result of results) {
+      if (result && result.status !== "Accepted") {
         hasFailure = true;
-        failureStatus = retryResults.failureStatus;
+        failureStatus = result.status;
+        break;
       }
     }
 
-    // console.log("Final Results:", results);
     return {
       results,
       hasFailure,
       failureStatus,
     };
   } catch (error) {
-    console.error("Error fetching batch results:" + error);
+    console.error(error);
+
     return {
       results: [],
       hasFailure: true,
-      failureStatus: "Failed to fetch",
+      failureStatus: "Judge0 Error",
     };
   }
 };
@@ -103,21 +111,71 @@ const getSubmissionResult = async (tokens) => {
 const judgeSubmission = async (req, res) => {
   try {
     const { language_id, base64EncodedCode, problemId } = req.body;
+
     if (!language_id || !base64EncodedCode || !problemId) {
       return res.status(400).json({
         success: false,
         message: "Not enough data",
       });
     }
-    const problems = await Problem.find({});
-    const problemdata = problems.find((problem) => problem.id == problemId);
-    const testCases = problemdata.testCases;
 
-    const submissions = testCases.map((test) => ({
-      language_id: language_id,
-      source_code: base64EncodedCode,
-      stdin: encodeBase64(test.input),
-      expected_output: encodeBase64(test.expectedOutput),
+    const problemData = await Problem.findOne({
+      id: Number(problemId),
+    }).select("+driverCode");
+
+    // console.log(problemData);
+    // console.log(problemData.toObject());
+
+    if (!problemData) {
+      return res.status(404).json({
+        success: false,
+        message: "Problem not found",
+      });
+    }
+
+    const languageMap = {
+      1: "c",
+      2: "cpp",
+      3: "java",
+      4: "python",
+      9: "javascript",
+    };
+
+    const language = languageMap[language_id];
+
+    if (!language) {
+      return res.status(400).json({
+        success: false,
+        message: "Unsupported language",
+      });
+    }
+
+    const userCode = decodeBase64(base64EncodedCode);
+
+    // console.log("Language ID:", language_id);
+    // console.log("Language:", language);
+    // console.log("Driver Code:", problemData.driverCode);
+    // console.log(
+    //   "Driver Code for language:",
+    //   problemData.driverCode?.[language],
+    // );
+    const finalSourceCode = problemData.driverCode[language].replace(
+      "{{USER_CODE}}",
+      userCode,
+    );
+
+    // Encode again for Judge0
+    const finalSourceCodeBase64 = encodeBase64(finalSourceCode);
+
+    const submissions = problemData.testCases.map((testCase) => ({
+      language_id,
+
+      source_code: finalSourceCodeBase64,
+
+      stdin: encodeBase64(testCase.input),
+
+      expected_output: encodeBase64(testCase.expectedOutput),
+
       callback_url: "https://localhost:4000/user/judge0-callback",
     }));
 
@@ -130,47 +188,51 @@ const judgeSubmission = async (req, res) => {
         fields: "*",
       },
       headers: {
-        "x-rapidapi-key": "bb2e866215msh150f4914a869517p1f7dc2jsn6c612857138c",
+        "x-rapidapi-key": process.env.RAPID_API_KEY,
         "x-rapidapi-host": "judge0-extra-ce.p.rapidapi.com",
         "Content-Type": "application/json",
       },
-      data: { submissions },
+      data: {
+        submissions,
+      },
     };
 
     const response = await axios.request(options);
-    // console.log("Batch Submission Response:", response.data);
 
-    if (response.data) {
-      const tokens = response.data.map((submission) => submission.token);
-      console.log(tokens);
-      const finalResult = await getSubmissionResult(tokens);
-      const { results, hasFailure, failureStatus } = finalResult;
-      // console.log(finalResult);
-      // console.log("Your father is checking your report" + results);
-
-      const updatedTestCases = testCases.map((testCase, index) => ({
-        ...testCase,
-        status: results[index]?.status || "Unknown",
-        stdout: results[index]?.stdout || "",
-      }));
-
-      return res.status(200).json({
-        success: true,
-        updatedTestCases,
-        results,
-        hasFailure,
-        failureStatus,
+    if (!response.data) {
+      return res.status(400).json({
+        success: false,
+        message: "Submission failed",
       });
     }
 
-    return res.status(400).json({
-      success: false,
-      message: "Gadbad yha hai chutiye",
+    const tokens = response.data.map((submission) => submission.token);
+
+    const finalResult = await getSubmissionResult(tokens);
+
+    const { results, hasFailure, failureStatus } = finalResult;
+
+    const updatedTestCases = problemData.testCases.map((testCase, index) => ({
+      ...testCase.toObject(),
+
+      status: results[index]?.status || "Unknown",
+
+      stdout: results[index]?.stdout || "",
+    }));
+
+    return res.status(200).json({
+      success: true,
+      updatedTestCases,
+      results,
+      hasFailure,
+      failureStatus,
     });
   } catch (error) {
-    return res.status(400).json({
+    console.log(error);
+
+    return res.status(500).json({
       success: false,
-      message: "Kuch to gadbad hai daya",
+      message: error.message,
     });
   }
 };
@@ -290,7 +352,7 @@ const getLikes = async (req, res) => {
     const problemId = req.params.problemId;
     const userId = req.user;
 
-    const problem = await Problem.findOne({ id: problemId }); 
+    const problem = await Problem.findOne({ id: problemId });
 
     if (!problem) {
       return res.status(400).json({
@@ -329,11 +391,13 @@ const getSolved = async (req, res) => {
     if (!user) {
       return res.status(404).json({
         success: false,
-        message: "User not found"
+        message: "User not found",
       });
     }
 
-    const isSolved = user.problemSolved?.some(id => id.toString() === problemId);
+    const isSolved = user.problemSolved?.some(
+      (id) => id.toString() === problemId,
+    );
 
     return res.status(200).json({
       success: true,
@@ -343,41 +407,41 @@ const getSolved = async (req, res) => {
   } catch (error) {
     return res.status(400).json({
       success: false,
-      message: error.message
+      message: error.message,
     });
   }
 };
 
-const analysis = async(req,res) => {
-  try{
+const analysis = async (req, res) => {
+  try {
     const code = req.body.code;
-    if(!code){
+    if (!code) {
       return res.status(400).json({
-        success:false,
-        message:"Plz give me the code"
-      })
+        success: false,
+        message: "Plz give me the code",
+      });
     }
-    const ai = new GoogleGenAI({apiKey:process.env.GOOGLE_API_KEY});
+    const ai = new GoogleGenAI({ apiKey: process.env.GOOGLE_API_KEY });
 
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: `Analyze the time and space complexity of the following code and reply with little explanation withhighlighted complexities in 90 words and not more than 3 lines first line time complexity second line space complexity and third line is explation and all there are in not markdown :\n\n${code}`
-    })
+      model: "gemini-3.5-flash",
+      contents: `Analyze the time and space complexity of the following code and reply with little explanation withhighlighted complexities in 90 words and not more than 3 lines first line time complexity second line space complexity and third line is explation and all there are in not markdown :\n\n${code}`,
+    });
 
     console.log(response.text);
 
     return res.status(200).json({
-      success:true,
-      message:"Analysis done",
-      analysis:response.text
-    })
-  }catch(error){
+      success: true,
+      message: "Analysis done",
+      analysis: response.text,
+    });
+  } catch (error) {
     return res.status(400).json({
-      success:false,
-      message:error.message
-    })
+      success: false,
+      message: error.message,
+    });
   }
-}
+};
 
 export {
   judgeSubmission,
@@ -387,5 +451,5 @@ export {
   getSpecificProblem,
   getLikes,
   getSolved,
-  analysis
+  analysis,
 };
