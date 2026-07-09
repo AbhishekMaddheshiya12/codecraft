@@ -20,7 +20,7 @@ app.use(express.urlencoded({ extended: true }));
 app.use(
   cors({
     origin: [
-      "https://codecraft-frontend-xuuw.onrender.com",
+      "https://code-craft-frontend-dusky.vercel.app",
       "http://localhost:5173",
     ],
     credentials: true,
