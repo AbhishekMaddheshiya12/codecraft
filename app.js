@@ -74,6 +74,8 @@ io.on("connection", (socket) => {
   });
 });
 
+// seedDatabase();
+
 app.use("/user", userRouter);
 app.use("/problems", problemRouter);
 
